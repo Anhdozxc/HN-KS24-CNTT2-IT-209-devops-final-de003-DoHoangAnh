@@ -1,0 +1,141 @@
+# =============================================================================
+#  .github/workflows/ci-cd.yml
+#  - job build : validate student.env -> build & smoke test -> push image to GHCR
+#  - job deploy: SSH into server -> pull image -> restart stack
+#
+#  NOTE: Image path is hardcoded as ghcr.io/anhdozxc/devops-final-app (all lowercase)
+#        to avoid "invalid reference format" errors from dynamic repository expressions.
+# =============================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/anhdozxc/devops-final-app
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Kiểm tra thông tin trong student.env
+        run: |
+          set -a; source student.env; set +a
+          for v in STUDENT_NAME STUDENT_ID STUDENT_CLASS STUDENT_EMAIL GITHUB_USERNAME \
+                   APP_PORT COMPOSE_PROJECT_NAME MYSQL_USER MYSQL_PASSWORD MYSQL_ROOT_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error file=student.env::Chưa điền $v trong student.env"
+              exit 1
+            fi
+          done
+          if [ "$APP_PORT" -lt 8080 ]; then
+            echo "::error file=student.env::APP_PORT phải từ 8080 trở lên"
+            exit 1
+          fi
+          echo "### Sinh viên: $STUDENT_NAME - $STUDENT_ID - $STUDENT_CLASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Đặt tên image
+        id: meta
+        run: echo "image=ghcr.io/anhdozxc/devops-final-app" >> "$GITHUB_OUTPUT"
+
+      - name: Build & chạy thử bằng Docker Compose
+        env:
+          APP_IMAGE: ghcr.io/anhdozxc/devops-final-app
+          APP_TAG: ${{ github.sha }}
+          APP_VERSION: ${{ github.sha }}
+        run: docker compose --env-file student.env up -d --build --wait --wait-timeout 300
+
+      - name: Smoke test
+        run: |
+          set -a; source student.env; set +a
+          BASE="http://localhost:${APP_PORT}"
+          curl -fsS --retry 12 --retry-delay 5 --retry-all-errors "$BASE/api/jobs" | grep -q '"id"'
+          echo "Smoke test OK"
+
+      - name: In log khi lỗi
+        if: failure()
+        run: docker compose --env-file student.env logs --no-color
+
+      - name: Đăng nhập GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image lên GHCR
+        run: |
+          docker tag "ghcr.io/anhdozxc/devops-final-app:${{ github.sha }}" "ghcr.io/anhdozxc/devops-final-app:latest"
+          docker push "ghcr.io/anhdozxc/devops-final-app:${{ github.sha }}"
+          docker push "ghcr.io/anhdozxc/devops-final-app:latest"
+
+      - name: Dọn dẹp
+        if: always()
+        run: docker compose --env-file student.env down -v
+
+  deploy:
+    name: Deploy lên server
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Deploy qua SSH
+        uses: appleboy/ssh-action@v0.1.10
+        env:
+          APP_IMAGE: ghcr.io/anhdozxc/devops-final-app
+          APP_TAG: ${{ github.sha }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_DIR: ${{ github.event.repository.name }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          envs: APP_IMAGE,APP_TAG,GHCR_USER,GHCR_TOKEN,DEPLOY_DIR,REPO_URL
+          script: |
+            set -e
+            DEPLOY_DIR="${DEPLOY_DIR:-HN_KS24_CNTT2_-IT-209-_Devops_Fundamentals_DoHoangAnh_Final}"
+            if [ -n "$REPO_URL" ] && [ ! -d "$HOME/$DEPLOY_DIR/.git" ]; then
+              git clone "$REPO_URL" "$HOME/$DEPLOY_DIR" || true
+            fi
+            mkdir -p "$HOME/$DEPLOY_DIR"
+            cd "$HOME/$DEPLOY_DIR"
+
+            if [ -d .git ]; then
+              git fetch origin main || true
+              git reset --hard origin/main || true
+            fi
+
+            # Login to GHCR
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            # Export image and tag for docker-compose
+            export APP_IMAGE="ghcr.io/anhdozxc/devops-final-app"
+            export APP_TAG="${{ github.sha }}"
+
+            # Pull the new app image (no build on server)
+            docker compose --env-file student.env pull app
+
+            # Start/restart the stack (no build on server)
+            docker compose --env-file student.env up -d --no-build
+
+            docker logout ghcr.io
+            docker compose --env-file student.env ps
